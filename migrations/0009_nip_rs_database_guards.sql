@@ -12,11 +12,11 @@ CREATE FUNCTION guard_nip_rs_watermark() RETURNS trigger AS $$
 DECLARE
     advanced BOOLEAN;
 BEGIN
-    IF NEW.kind = 30078
-       AND NEW.d_tag ~ '^read-state:[0-9a-f]{32}$'
+    IF (NEW).kind = 30078
+       AND (NEW).d_tag ~ '^read-state:[0-9a-f]{32}$'
        AND EXISTS (
            SELECT 1
-           FROM jsonb_array_elements(NEW.tags) tag
+           FROM jsonb_array_elements((NEW).tags) tag
            WHERE jsonb_typeof(tag) = 'array'
              AND jsonb_array_length(tag) = 2
              AND tag->>0 = 't'
@@ -25,7 +25,7 @@ BEGIN
         INSERT INTO parameterized_event_watermarks
             (community_id, kind, pubkey, d_tag, created_at, event_id)
         VALUES
-            (NEW.community_id, NEW.kind, NEW.pubkey, NEW.d_tag, NEW.created_at, NEW.id)
+            ((NEW).community_id, (NEW).kind, (NEW).pubkey, (NEW).d_tag, (NEW).created_at, (NEW).id)
         ON CONFLICT (community_id, kind, pubkey, d_tag) DO UPDATE SET
             created_at = EXCLUDED.created_at,
             event_id = EXCLUDED.event_id
@@ -48,12 +48,12 @@ BEGIN
                  AND live.created_at = watermark.created_at
                  AND live.id = watermark.event_id
                  AND live.deleted_at IS NULL
-                WHERE watermark.community_id = NEW.community_id
-                  AND watermark.kind = NEW.kind
-                  AND watermark.pubkey = NEW.pubkey
-                  AND watermark.d_tag = NEW.d_tag
-                  AND watermark.created_at = NEW.created_at
-                  AND watermark.event_id = NEW.id
+                WHERE watermark.community_id = (NEW).community_id
+                  AND watermark.kind = (NEW).kind
+                  AND watermark.pubkey = (NEW).pubkey
+                  AND watermark.d_tag = (NEW).d_tag
+                  AND watermark.created_at = (NEW).created_at
+                  AND watermark.event_id = (NEW).id
             ) THEN
                 RETURN NEW;
             END IF;
@@ -76,53 +76,67 @@ CREATE TRIGGER trg_events_nip_rs_watermark
 -- including NIP-09 coordinate deletion during a mixed-version rollout.
 CREATE FUNCTION purge_soft_deleted_nip_rs() RETURNS trigger AS $$
 BEGIN
-    IF OLD.deleted_at IS NULL
-       AND NEW.deleted_at IS NOT NULL
-       AND NEW.kind = 30078
-       AND NEW.d_tag ~ '^read-state:[0-9a-f]{32}$'
+    IF (OLD).deleted_at IS NULL
+       AND (NEW).deleted_at IS NOT NULL
+       AND (NEW).kind = 30078
+       AND (NEW).d_tag ~ '^read-state:[0-9a-f]{32}$'
        AND EXISTS (
            SELECT 1
-           FROM jsonb_array_elements(NEW.tags) tag
+           FROM jsonb_array_elements((NEW).tags) tag
            WHERE jsonb_typeof(tag) = 'array'
              AND jsonb_array_length(tag) = 2
              AND tag->>0 = 't'
              AND tag->>1 = 'read-state'
        ) THEN
         DELETE FROM events
-        WHERE community_id = NEW.community_id
-          AND created_at = NEW.created_at
-          AND id = NEW.id;
+        WHERE community_id = (NEW).community_id
+          AND created_at = (NEW).created_at
+          AND id = (NEW).id;
 
         DELETE FROM event_mentions
-        WHERE community_id = NEW.community_id AND event_id = NEW.id;
+        WHERE community_id = (NEW).community_id AND event_id = (NEW).id;
     END IF;
 
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
 
+-- Dual-compat: AFTER UPDATE (no `OF deleted_at` column list — unsupported on
+-- CockroachDB). The (OLD).deleted_at IS NULL AND (NEW).deleted_at IS NOT NULL
+-- guard in the body keeps this a no-op except on the soft-delete transition.
 CREATE TRIGGER trg_events_purge_soft_deleted_nip_rs
-    AFTER UPDATE OF deleted_at ON events
+    AFTER UPDATE ON events
     FOR EACH ROW EXECUTE FUNCTION purge_soft_deleted_nip_rs();
 
 -- Mention indexing runs after the event transaction commits. Lock the live event
 -- row while a mention is inserted so a concurrent hard delete cannot leave an
 -- orphan behind; if deletion already won, silently skip the stale index row.
 CREATE FUNCTION guard_event_mention_live() RETURNS trigger AS $$
+DECLARE
+    live_row INT;
 BEGIN
-    IF NEW.event_kind IS DISTINCT FROM 30078 THEN
+    IF (NEW).event_kind IS DISTINCT FROM 30078 THEN
         RETURN NEW;
     END IF;
 
-    PERFORM 1
+    -- Dual-compat: SELECT ... INTO ... FOR UPDATE. CockroachDB does not
+    -- implement FOR KEY SHARE, nor a locking clause on plpgsql PERFORM; the
+    -- SELECT ... INTO form with FOR UPDATE is valid on both engines and still
+    -- sets FOUND. FOR UPDATE is a stronger lock than the original FOR KEY SHARE
+    -- but preserves the "lock the live event row while a mention is inserted"
+    -- guarantee this guard needs.
+    SELECT 1 INTO live_row
     FROM events
-    WHERE community_id = NEW.community_id
-      AND id = NEW.event_id
-      AND created_at = NEW.event_created_at
+    WHERE community_id = (NEW).community_id
+      AND id = (NEW).event_id
+      AND created_at = (NEW).event_created_at
       AND deleted_at IS NULL
-    FOR KEY SHARE;
+    FOR UPDATE;
 
-    IF NOT FOUND THEN
+    -- Dual-compat: test the selected value for NULL rather than the FOUND
+    -- special variable (CockroachDB resolves bare FOUND as a column here). A
+    -- no-match SELECT ... INTO leaves live_row NULL on both engines.
+    IF live_row IS NULL THEN
         RETURN NULL;
     END IF;
 
