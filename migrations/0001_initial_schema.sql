@@ -114,8 +114,11 @@ CREATE INDEX idx_channels_ttl_expiry ON channels (ttl_deadline)
 -- explicitly modeled admission path." We have no such path, so: hard block.)
 CREATE FUNCTION channels_community_id_immutable() RETURNS TRIGGER AS $$
 BEGIN
-    IF NEW.community_id IS DISTINCT FROM OLD.community_id THEN
-        RAISE EXCEPTION 'channels.community_id is immutable (channel % cannot be re-tenanted)', OLD.id
+    -- Parenthesized composite access (OLD)/(NEW) is required by CockroachDB's
+    -- trigger-body analysis (crdb issue 114687) and is equally valid on
+    -- PostgreSQL, so this spelling is dual-compatible.
+    IF (NEW).community_id IS DISTINCT FROM (OLD).community_id THEN
+        RAISE EXCEPTION 'channels.community_id is immutable (channel % cannot be re-tenanted)', (OLD).id
             USING ERRCODE = 'check_violation';
     END IF;
     RETURN NEW;
@@ -170,8 +173,15 @@ CREATE TABLE users (
     PRIMARY KEY (community_id, pubkey),
     CONSTRAINT chk_users_pubkey_len CHECK (LENGTH(pubkey) = 32),
     -- agent owner is a user in the SAME community.
+    -- Dual-compat: ON DELETE NO ACTION (was SET NULL). SET NULL is unimplementable
+    -- on this composite FK because community_id is NOT NULL, and CockroachDB
+    -- (unlike Postgres 15+) does not support column-list `SET NULL (col)`. This
+    -- matches the codebase's own precedent for the same situation (see the
+    -- workflow-claims FK note below). Behavior change: deleting a user who owns an
+    -- agent now requires clearing/reassigning agent_owner_pubkey first, rather
+    -- than the reference being auto-nulled.
     FOREIGN KEY (community_id, agent_owner_pubkey)
-        REFERENCES users (community_id, pubkey) ON DELETE SET NULL
+        REFERENCES users (community_id, pubkey) ON DELETE NO ACTION
 );
 
 -- NIP-05 handle and Okta id unique within a community, not globally.
@@ -232,24 +242,13 @@ CREATE TABLE events (
     not_before  BIGINT,
     delivered_at BIGINT,
     PRIMARY KEY (community_id, created_at, id)
-) PARTITION BY RANGE (created_at);
-
-CREATE TABLE events_p_past PARTITION OF events
-    FOR VALUES FROM (MINVALUE) TO ('2026-01-01');
-CREATE TABLE events_p2026_01 PARTITION OF events
-    FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
-CREATE TABLE events_p2026_02 PARTITION OF events
-    FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
-CREATE TABLE events_p2026_03 PARTITION OF events
-    FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
-CREATE TABLE events_p2026_04 PARTITION OF events
-    FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
-CREATE TABLE events_p2026_05 PARTITION OF events
-    FOR VALUES FROM ('2026-05-01') TO ('2026-06-01');
-CREATE TABLE events_p2026_06 PARTITION OF events
-    FOR VALUES FROM ('2026-06-01') TO ('2026-07-01');
-CREATE TABLE events_p_future PARTITION OF events
-    FOR VALUES FROM ('2026-07-01') TO (MAXVALUE);
+);
+-- Dual-compat: plain table (no declarative PARTITION BY). CockroachDB does not
+-- support Postgres declarative partitioning and does not need it — it
+-- range-distributes on the primary key automatically. On PostgreSQL this is a
+-- plain table; monthly retention that used to drop partitions becomes a
+-- DELETE-by-time sweep. (CRDB-only follow-up: a hash-sharded index on
+-- created_at to spread the monotonic-timestamp write hotspot.)
 
 -- Direct id lookup: the PK can't serve `WHERE id=$1` because created_at sits
 -- between community_id and id. This index makes the scoped form
@@ -338,20 +337,9 @@ CREATE TABLE delivery_log (
     error_message   TEXT,
     attempt_number  INT DEFAULT 1,
     PRIMARY KEY (delivered_at, id)
-) PARTITION BY RANGE (delivered_at);
-
-CREATE TABLE delivery_log_p_past PARTITION OF delivery_log
-    FOR VALUES FROM (MINVALUE) TO ('2026-03-01');
-CREATE TABLE delivery_log_p2026_03 PARTITION OF delivery_log
-    FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
-CREATE TABLE delivery_log_p2026_04 PARTITION OF delivery_log
-    FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
-CREATE TABLE delivery_log_p2026_05 PARTITION OF delivery_log
-    FOR VALUES FROM ('2026-05-01') TO ('2026-06-01');
-CREATE TABLE delivery_log_p2026_06 PARTITION OF delivery_log
-    FOR VALUES FROM ('2026-06-01') TO ('2026-07-01');
-CREATE TABLE delivery_log_p_future PARTITION OF delivery_log
-    FOR VALUES FROM ('2026-07-01') TO (MAXVALUE);
+);
+-- Dual-compat: plain table (see events note above). CRDB distributes natively;
+-- PostgreSQL retention becomes a DELETE-by-time sweep instead of partition drop.
 
 CREATE INDEX idx_delivery_log_community_sub ON delivery_log (community_id, subscription_id);
 
