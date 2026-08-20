@@ -9,8 +9,12 @@
 -- high-water mark: without it, an old instance could insert between the seed
 -- and purge, then a later NIP-09 deletion could reopen a replay window. Reads
 -- remain available; inserts, updates, and deletes wait for migration commit.
-LOCK TABLE events IN SHARE ROW EXCLUSIVE MODE;
-
+--
+-- Dual-compat: the explicit `LOCK TABLE events IN SHARE ROW EXCLUSIVE MODE` was
+-- removed — CockroachDB does not support that lock-mode syntax. This is a
+-- one-time bootstrap migration; on a fresh install (both engines) events is
+-- empty so the rolling-deploy race the lock guarded cannot occur. Brownfield
+-- PostgreSQL keeps its original (unedited) migration history.
 CREATE TABLE parameterized_event_watermarks (
     community_id  UUID NOT NULL REFERENCES communities(id),
     kind          INT NOT NULL,

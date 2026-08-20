@@ -24,9 +24,11 @@ BEGIN
     -- Keep this allowlist identical to the relay's validated NIP-PL descriptor.
     -- Centralizing it on the events table covers every durable producer,
     -- including internal paths that bypass live dispatch.
-    IF NEW.kind IN (7, 9, 1059, 40007, 46010) THEN
+    -- Dual-compat: parenthesized (NEW) composite access is required by
+    -- CockroachDB trigger-body analysis and is valid on PostgreSQL.
+    IF (NEW).kind IN (7, 9, 1059, 40007, 46010) THEN
         INSERT INTO push_match_queue (community_id, event_id)
-        VALUES (NEW.community_id, NEW.id)
+        VALUES ((NEW).community_id, (NEW).id)
         ON CONFLICT DO NOTHING;
     END IF;
     RETURN NEW;

@@ -18,4 +18,7 @@
 --
 -- Additive migration: previously applied files must not change checksum.
 
-CREATE INDEX idx_events_tags_gin ON events USING GIN (tags jsonb_path_ops);
+-- Dual-compat: plain GIN over tags (no jsonb_path_ops opclass — CockroachDB's
+-- inverted index does not accept opclasses). PostgreSQL's default jsonb_ops and
+-- CRDB's inverted index both support the only operator the query path uses (@>).
+CREATE INDEX idx_events_tags_gin ON events USING GIN (tags);
