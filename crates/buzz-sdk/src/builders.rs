@@ -12,7 +12,7 @@ use buzz_core::{
         KIND_GIT_STATUS_OPEN, KIND_IA_ARCHIVE_REQUEST, KIND_IA_UNARCHIVE_REQUEST,
         KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT,
         KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE, KIND_PROJECT,
-        KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
+        KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER, KIND_WORKFLOW_UPDATE,
     },
     observer::{
         content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -1627,6 +1627,30 @@ pub fn build_workflow_update(
         tag(&["expected-revision", expected_revision])?,
     ];
     Ok(EventBuilder::new(Kind::Custom(KIND_WORKFLOW_DEF as u16), yaml).tags(tags))
+}
+
+/// Build a workflow update request (kind 46021) for an existing workflow.
+///
+/// The request is signed by the managing actor. The `a` tag retains the
+/// original workflow owner's kind:30620 coordinate so the relay can authorize
+/// an owning human without changing workflow authorship or execution authority.
+pub fn build_workflow_update_request(
+    owner_pubkey: &str,
+    channel_id: Uuid,
+    workflow_id: Uuid,
+    yaml: &str,
+    expected_revision: &str,
+) -> Result<EventBuilder, SdkError> {
+    check_content(yaml, 64 * 1024)?;
+    let owner = check_pubkey_hex(owner_pubkey, "workflow owner")?;
+    let revision = check_hex_exact(expected_revision, 64, "expected revision")?;
+    let coordinate = format!("{KIND_WORKFLOW_DEF}:{owner}:{workflow_id}");
+    let tags = vec![
+        tag(&["a", &coordinate])?,
+        tag(&["h", &channel_id.to_string()])?,
+        tag(&["expected-revision", &revision])?,
+    ];
+    Ok(EventBuilder::new(Kind::Custom(KIND_WORKFLOW_UPDATE as u16), yaml).tags(tags))
 }
 
 /// Build a NIP-09 deletion event targeting a workflow definition (kind 5).
@@ -3980,6 +4004,22 @@ mod tests {
         assert!(has_tag(&ev, "d", &wid.to_string()));
         assert!(has_tag(&ev, "h", &cid.to_string()));
         assert!(has_tag(&ev, "expected-revision", &revision));
+    }
+
+    #[test]
+    fn workflow_update_request_addresses_owner_definition() {
+        let cid = uuid();
+        let wid = uuid();
+        let owner = "b".repeat(64);
+        let revision = "a".repeat(64);
+        let ev = sign(
+            build_workflow_update_request(&owner, cid, wid, "name: updated", &revision).unwrap(),
+        );
+
+        assert_eq!(ev.kind.as_u16(), 46021);
+        assert_eq!(tag_values(&ev, "a"), vec![format!("30620:{owner}:{wid}")]);
+        assert_eq!(tag_values(&ev, "h"), vec![cid.to_string()]);
+        assert_eq!(tag_values(&ev, "expected-revision"), vec![revision]);
     }
 
     #[test]

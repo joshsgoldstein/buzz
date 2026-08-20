@@ -625,7 +625,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 31);
+        assert_eq!(migrations.len(), 32);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -1057,6 +1057,20 @@ mod tests {
             .as_str()
             .contains("error_code"));
         assert!(include_str!("../../../schema/schema.sql").contains("error_code          TEXT"));
+    }
+
+    #[test]
+    fn workflow_revision_migration_backfills_accepted_request_ids() {
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 32)
+            .expect("workflow revision migration");
+        let sql = migration.sql.as_str();
+
+        assert!(sql.contains("ALTER TABLE workflows ADD COLUMN revision_event_id BYTEA"));
+        assert!(sql.contains("WHERE kind = 30620"));
+        assert!(sql.contains("definition.id"));
+        assert!(sql.contains("octet_length(revision_event_id) = 32"));
     }
 
     #[test]

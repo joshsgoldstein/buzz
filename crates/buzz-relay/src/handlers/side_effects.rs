@@ -17,6 +17,7 @@ use buzz_core::StoredEvent;
 use buzz_db::channel::{MemberRecord, MemberRole};
 
 use super::event::dispatch_persistent_event;
+use super::workflow_state::{build_workflow_state, store_workflow_state, WorkflowStateStatus};
 use crate::protocol::RelayMessage;
 use crate::state::AppState;
 use buzz_core::tenant::TenantContext;
@@ -2080,6 +2081,41 @@ async fn handle_leave_request(
 // handle_reaction() removed — kind:7 reaction dedup and DB writes are now
 // handled inline in ingest_event() before storage (see ingest.rs step 20a).
 
+async fn publish_deleted_workflow_state(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    workflow_id: Uuid,
+    channel_id: Uuid,
+    owner: &[u8],
+    actor: &[u8],
+    request_id: nostr::EventId,
+) -> anyhow::Result<()> {
+    let event = build_workflow_state(
+        &state.relay_keypair,
+        workflow_id,
+        channel_id,
+        owner,
+        actor,
+        request_id,
+        "",
+        WorkflowStateStatus::Deleted,
+    )?;
+    let mut tx = state.db.begin_transaction().await?;
+    let stored = store_workflow_state(&mut tx, tenant.community(), &event, channel_id).await?;
+    tx.commit().await?;
+    let relay_pubkey = state.relay_keypair.public_key().to_hex();
+    dispatch_persistent_event(
+        tenant,
+        state,
+        &stored,
+        buzz_core::kind::KIND_WORKFLOW_STATE,
+        &relay_pubkey,
+        None,
+    )
+    .await;
+    Ok(())
+}
+
 /// Handle NIP-09 deletion via `a` tag (addressable/parameterized-replaceable events).
 /// Parses "kind:pubkey:d-tag" and deletes the corresponding DB record.
 async fn handle_a_tag_deletion(
@@ -2104,6 +2140,11 @@ async fn handle_a_tag_deletion(
     let pubkey_hex = parts[1];
     let d_tag = parts[2];
     let actor_bytes = effective_message_author(event, &state.relay_keypair.public_key());
+    let target_owner =
+        hex::decode(pubkey_hex).map_err(|_| anyhow::anyhow!("invalid pubkey in a-tag"))?;
+    if target_owner.len() != 32 {
+        return Err(anyhow::anyhow!("invalid pubkey in a-tag"));
+    }
 
     match kind_num {
         // kind:30350 revocation is exclusively a higher-generation inactive replacement.
@@ -2113,28 +2154,48 @@ async fn handle_a_tag_deletion(
         buzz_core::kind::KIND_WORKFLOW_DEF => {
             // Try UUID first (workflow_id); fall back to name-based lookup.
             if let Ok(wf_id) = uuid::Uuid::parse_str(d_tag) {
+                let workflow = state
+                    .db
+                    .get_workflow(tenant.community(), wf_id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to find workflow {wf_id}: {e}"))?;
+                if workflow.owner_pubkey != target_owner {
+                    return Err(anyhow::anyhow!(
+                        "workflow owner does not match deletion coordinate"
+                    ));
+                }
                 let channel_id = state
                     .db
-                    .delete_workflow_for_owner(tenant.community(), wf_id, &actor_bytes)
+                    .delete_workflow_for_owner(tenant.community(), wf_id, &target_owner)
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to delete workflow {wf_id}: {e}"))?;
                 if let Some(channel_id) = channel_id {
                     state
                         .workflow_engine
                         .invalidate_channel_workflows(tenant.community(), channel_id);
+                    publish_deleted_workflow_state(
+                        tenant,
+                        state,
+                        wf_id,
+                        channel_id,
+                        &target_owner,
+                        &actor_bytes,
+                        event.id,
+                    )
+                    .await?;
                 }
                 tracing::info!(workflow_id = %wf_id, "Workflow deleted via NIP-09 a-tag (UUID)");
             } else {
                 // Name-based lookup
                 match state
                     .db
-                    .find_workflow_by_owner_and_name(tenant.community(), &actor_bytes, d_tag)
+                    .find_workflow_by_owner_and_name(tenant.community(), &target_owner, d_tag)
                     .await
                 {
                     Ok(Some(wf)) => {
                         let channel_id = state
                             .db
-                            .delete_workflow_for_owner(tenant.community(), wf.id, &actor_bytes)
+                            .delete_workflow_for_owner(tenant.community(), wf.id, &target_owner)
                             .await
                             .map_err(|e| {
                                 anyhow::anyhow!("failed to delete workflow {}: {e}", wf.id)
@@ -2143,6 +2204,16 @@ async fn handle_a_tag_deletion(
                             state
                                 .workflow_engine
                                 .invalidate_channel_workflows(tenant.community(), channel_id);
+                            publish_deleted_workflow_state(
+                                tenant,
+                                state,
+                                wf.id,
+                                channel_id,
+                                &target_owner,
+                                &actor_bytes,
+                                event.id,
+                            )
+                            .await?;
                         }
                         tracing::info!(workflow_id = %wf.id, name = d_tag, "Workflow deleted via NIP-09 a-tag (name)");
                     }

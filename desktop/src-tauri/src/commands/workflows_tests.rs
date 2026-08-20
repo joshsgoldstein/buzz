@@ -20,6 +20,33 @@ fn wf_event(d: &str, h: &str, yaml: &str) -> nostr::Event {
         .expect("sign")
 }
 
+fn wf_state(
+    d: &str,
+    h: &str,
+    owner: &nostr::PublicKey,
+    revision: &nostr::EventId,
+    status: &str,
+    yaml: &str,
+) -> nostr::Event {
+    let relay = Keys::generate();
+    let owner = owner.to_hex();
+    let revision = revision.to_hex();
+    let tags: Vec<Tag> = [
+        vec!["d", d],
+        vec!["h", h],
+        vec!["owner", &owner],
+        vec!["e", &revision, "", "request"],
+        vec!["status", status],
+    ]
+    .into_iter()
+    .map(|tag| Tag::parse(tag).expect("parse tag"))
+    .collect();
+    EventBuilder::new(Kind::Custom(30623), yaml)
+        .tags(tags)
+        .sign_with_keys(&relay)
+        .expect("sign")
+}
+
 const CHAN: &str = "11111111-1111-1111-1111-111111111111";
 const WF: &str = "22222222-2222-2222-2222-222222222222";
 
@@ -48,6 +75,29 @@ fn workflow_from_event_maps_all_fields() {
     assert_eq!(wf.status, "active");
     assert_eq!(wf.created_at, ev.created_at.as_secs() as i64);
     assert_eq!(wf.updated_at, ev.created_at.as_secs() as i64);
+}
+
+#[test]
+fn relay_state_wins_without_changing_owner_or_revision() {
+    let legacy = wf_event(WF, CHAN, "name: Old\nsteps: []\n");
+    let request = EventBuilder::new(Kind::Custom(46021), "update")
+        .tags([])
+        .sign_with_keys(&Keys::generate())
+        .expect("sign request");
+    let state = wf_state(WF, CHAN, &legacy.pubkey, &request.id, "active", YAML);
+
+    let workflows = workflows_from_events(&[legacy.clone(), state]);
+    assert_eq!(workflows.len(), 1);
+    assert_eq!(workflows[0].owner_pubkey, legacy.pubkey.to_hex());
+    assert_eq!(workflows[0].revision, request.id.to_hex());
+    assert_eq!(workflows[0].name, "Greet on join");
+}
+
+#[test]
+fn deleted_relay_state_suppresses_legacy_definition() {
+    let legacy = wf_event(WF, CHAN, YAML);
+    let deleted = wf_state(WF, CHAN, &legacy.pubkey, &legacy.id, "deleted", "");
+    assert!(workflows_from_events(&[legacy, deleted]).is_empty());
 }
 
 #[test]
@@ -202,14 +252,14 @@ fn multi_channel_workflow_query_uses_one_filter_per_channel() {
     assert_eq!(
         filters[0],
         serde_json::json!({
-            "kinds": [30620],
+            "kinds": [30623, 30620],
             "#h": [CHAN],
         })
     );
     assert_eq!(
         filters[1],
         serde_json::json!({
-            "kinds": [30620],
+            "kinds": [30623, 30620],
             "#h": [other_channel],
         })
     );
@@ -242,14 +292,14 @@ fn workflow_query_results_are_deduplicated_by_event_id() {
     let second_workflow = "33333333-3333-3333-3333-333333333333";
     let second = wf_event(second_workflow, CHAN, YAML);
     let mut workflows = Vec::new();
-    let mut seen_event_ids = HashSet::new();
+    let mut seen_workflow_ids = HashSet::new();
 
     append_unique_workflows(
         &mut workflows,
-        &mut seen_event_ids,
+        &mut seen_workflow_ids,
         &[first.clone(), second.clone()],
     );
-    append_unique_workflows(&mut workflows, &mut seen_event_ids, &[first, second]);
+    append_unique_workflows(&mut workflows, &mut seen_workflow_ids, &[first, second]);
 
     assert_eq!(workflows.len(), 2);
     assert_eq!(workflows[0].id, WF);

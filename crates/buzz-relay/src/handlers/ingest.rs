@@ -33,8 +33,8 @@ use buzz_core::kind::{
     KIND_STREAM_MESSAGE_DIFF, KIND_STREAM_MESSAGE_EDIT, KIND_STREAM_MESSAGE_PINNED,
     KIND_STREAM_MESSAGE_SCHEDULED, KIND_STREAM_MESSAGE_V2, KIND_STREAM_REMINDER, KIND_TEAM,
     KIND_TEAM_CATALOG, KIND_TEXT_NOTE, KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
-    RELAY_ADMIN_ADD_MEMBER, RELAY_ADMIN_CHANGE_ROLE, RELAY_ADMIN_REMOVE_MEMBER,
-    RELAY_ADMIN_SET_WORKSPACE_PROFILE,
+    KIND_WORKFLOW_UPDATE, RELAY_ADMIN_ADD_MEMBER, RELAY_ADMIN_CHANGE_ROLE,
+    RELAY_ADMIN_REMOVE_MEMBER, RELAY_ADMIN_SET_WORKSPACE_PROFILE,
 };
 use buzz_core::tenant::TenantContext;
 use buzz_core::verification::verify_event;
@@ -448,7 +448,7 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_GIT_STATUS_DRAFT => Ok(Scope::MessagesWrite),
         // Command kinds — DM management, workflows, approvals
         KIND_DM_OPEN | KIND_DM_ADD_MEMBER | KIND_DM_HIDE => Ok(Scope::MessagesWrite),
-        KIND_WORKFLOW_DEF | KIND_WORKFLOW_TRIGGER => Ok(Scope::MessagesWrite),
+        KIND_WORKFLOW_DEF | KIND_WORKFLOW_TRIGGER | KIND_WORKFLOW_UPDATE => Ok(Scope::MessagesWrite),
         KIND_APPROVAL_GRANT | KIND_APPROVAL_DENY => Ok(Scope::MessagesWrite),
         _ => Err("restricted: unknown event kind"),
     }
@@ -3498,6 +3498,14 @@ mod tests {
                 "kind {kind} should require MessagesWrite scope"
             );
         }
+    }
+
+    #[test]
+    fn workflow_update_command_requires_messages_write_scope() {
+        assert_eq!(
+            required_scope_for_kind(KIND_WORKFLOW_UPDATE, &make_dummy_event()),
+            Ok(Scope::MessagesWrite)
+        );
     }
 
     #[test]
