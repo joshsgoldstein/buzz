@@ -57,7 +57,8 @@ pub enum ChannelScope {
 /// Search matching semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchMode {
-    /// Standard NIP-50-ish word/lexeme search using `websearch_to_tsquery`.
+    /// Standard NIP-50-ish word/lexeme search using `plainto_tsquery` (all
+    /// normalized terms must match). Dual-compatible: PostgreSQL + CockroachDB.
     FullText,
     /// Prefix-match the trailing normalized query token (`pro` matches `project`).
     ///
@@ -115,7 +116,7 @@ pub struct SearchHit {
     pub channel_id: Option<Uuid>,
     /// Unix seconds.
     pub created_at: i64,
-    /// `ts_rank_cd` relevance score (higher = better).
+    /// `ts_rank` relevance score (higher = better).
     pub rank: f32,
 }
 
@@ -142,41 +143,77 @@ const PAGE_MAX: u32 = 1000;
 fn push_tsquery(qb: &mut QueryBuilder<sqlx::Postgres>, mode: SearchMode, search_text: &str) {
     match mode {
         SearchMode::FullText => {
-            qb.push("websearch_to_tsquery('simple', ");
+            // plainto_tsquery is supported by both PostgreSQL and CockroachDB
+            // v26.2.2; websearch_to_tsquery is NOT supported by CockroachDB, so we
+            // cannot use it in the dual-compatible build. plainto_tsquery normalizes
+            // the input and AND-joins the resulting lexemes. The tradeoff: it drops
+            // web-search operators (quoted phrases, `OR`, leading `-` negation) and
+            // treats the query as a bag of words that must all match. Buzz's NIP-50
+            // search surface already treats the query text as words to match, so
+            // this is behavior-preserving for our callers. If web-search operators
+            // are ever required, build a `to_tsquery` string in Rust instead
+            // (AND-join terms, `<->` for quoted phrases, `!` for negation) — that is
+            // also dual-compatible, at the cost of a hand-rolled parser.
+            qb.push("plainto_tsquery('simple', ");
             qb.push_bind(search_text);
             qb.push(")");
         }
         SearchMode::Prefix => {
-            // Prefix mode is for typeahead: completed whitespace-delimited tokens
-            // are exact, and only the trailing token is suffixed with `:*`.
-            // Each raw token still goes through Postgres' `simple` parser before
-            // tsquery construction so query-side normalization matches the
-            // `search_tsv` generated column. `quote_literal` prevents tsquery
-            // syntax injection from punctuation/operators in the raw topbar input.
-            qb.push(
-                "(SELECT COALESCE(\
-                 string_agg(\
-                   quote_literal(lexeme) || CASE WHEN token_ord = max_token_ord THEN ':*' ELSE '' END, \
-                   ' & ' ORDER BY token_ord, lex_ord\
-                 ), \
-                 ''\
-                 )::tsquery \
-                 FROM (\
-                   SELECT raw_token.token_ord, normalized.lexeme, normalized.lex_ord, raw_token.max_token_ord \
-                   FROM (\
-                     SELECT token, token_ord, max(token_ord) OVER () AS max_token_ord \
-                     FROM regexp_split_to_table(",
-            );
-            qb.push_bind(search_text);
-            qb.push(
-                ", '\\s+') WITH ORDINALITY AS split(token, token_ord)\
-                   ) AS raw_token \
-                   CROSS JOIN LATERAL unnest(tsvector_to_array(to_tsvector('simple', raw_token.token))) \
-                     WITH ORDINALITY AS normalized(lexeme, lex_ord)\
-                 ) AS prefix_terms)",
-            );
+            // Typeahead prefix match, dual-compatible (PostgreSQL + CockroachDB).
+            //
+            // The previous implementation normalized each token through
+            // `to_tsvector` + `tsvector_to_array` + `unnest(...) WITH ORDINALITY`.
+            // CockroachDB does not reliably support `tsvector_to_array` nor
+            // `WITH ORDINALITY` over a set-returning builtin, so that shape is out.
+            //
+            // Instead we build the tsquery text in Rust and hand it to
+            // `to_tsquery('simple', $1)` (supported by both engines): every
+            // completed whitespace-delimited token is AND-joined as an exact lexeme
+            // and the trailing token is marked with `:*` for prefix matching. Tokens
+            // are reduced to their alphanumeric characters so tsquery operators in
+            // the raw topbar input cannot inject query syntax (the old code relied
+            // on `quote_literal` for the same protection).
+            //
+            // Behavior change vs. the old builder: a single raw token that
+            // Postgres' text parser would have split into several lexemes (e.g.
+            // "foo.bar" -> "foo","bar") is here collapsed to one alphanumeric run
+            // ("foobar"). For typeahead over names/words this is not observable, and
+            // both engines still apply `simple`-config normalization (lowercasing)
+            // to the lexemes via `to_tsquery`, matching the `search_tsv` column.
+            qb.push("to_tsquery('simple', ");
+            qb.push_bind(build_prefix_tsquery(search_text));
+            qb.push(")");
         }
     }
+}
+
+/// Build the input string for `to_tsquery('simple', …)` in prefix/typeahead mode.
+///
+/// Splits `search_text` on whitespace, reduces each token to its alphanumeric
+/// characters (so tsquery operators in raw input cannot inject syntax), AND-joins
+/// the completed tokens, and marks the trailing token with `:*` for prefix
+/// matching. Returns an empty string when no usable token remains; `to_tsquery`
+/// then yields an empty tsquery that matches nothing, which is the desired
+/// "no hits" outcome and is valid on both PostgreSQL and CockroachDB.
+fn build_prefix_tsquery(search_text: &str) -> String {
+    let tokens: Vec<String> = search_text
+        .split_whitespace()
+        .map(|tok| tok.chars().filter(|c| c.is_alphanumeric()).collect::<String>())
+        .filter(|tok| !tok.is_empty())
+        .collect();
+
+    let last = tokens.len().saturating_sub(1);
+    let mut out = String::new();
+    for (i, tok) in tokens.iter().enumerate() {
+        if i > 0 {
+            out.push_str(" & ");
+        }
+        out.push_str(tok);
+        if i == last {
+            out.push_str(":*");
+        }
+    }
+    out
 }
 fn normalized_search_text(q: &str) -> Option<String> {
     let trimmed = q.trim();
@@ -202,7 +239,7 @@ fn normalized_search_text(q: &str) -> Option<String> {
 /// SQL shape (always):
 /// ```sql
 /// SELECT id, kind, pubkey, channel_id, EXTRACT(EPOCH FROM created_at)::bigint AS created_at_s,
-///        ts_rank_cd(search_tsv, query) AS rank
+///        ts_rank(search_tsv, query) AS rank
 /// FROM events,
 ///      <mode-specific tsquery> AS query
 /// WHERE community_id = $ctx
@@ -244,7 +281,7 @@ pub async fn search(pool: &PgPool, query: &SearchQuery) -> Result<SearchResult, 
     let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
         "SELECT id, kind, pubkey, channel_id, \
          EXTRACT(EPOCH FROM created_at)::bigint AS created_at_s, \
-         ts_rank_cd(search_tsv, search_query.query) AS rank \
+         ts_rank(search_tsv, search_query.query) AS rank \
          FROM events CROSS JOIN LATERAL (SELECT ",
     );
     push_tsquery(&mut qb, query.mode, &search_text);
@@ -304,7 +341,7 @@ pub async fn search(pool: &PgPool, query: &SearchQuery) -> Result<SearchResult, 
     }
 
     if prioritize_exact_profile_lexeme {
-        qb.push(" ORDER BY search_tsv @@ websearch_to_tsquery('simple', ");
+        qb.push(" ORDER BY search_tsv @@ plainto_tsquery('simple', ");
         qb.push_bind(&search_text);
         qb.push(") DESC, rank DESC, created_at DESC, id LIMIT ");
     } else {
@@ -358,6 +395,32 @@ mod tests {
             normalized_search_text("foo\0bar").as_deref(),
             Some("foo bar")
         );
+    }
+
+    #[test]
+    fn build_prefix_tsquery_marks_last_token() {
+        assert_eq!(build_prefix_tsquery("pro"), "pro:*");
+        assert_eq!(build_prefix_tsquery("hello wor"), "hello & wor:*");
+        assert_eq!(
+            build_prefix_tsquery("foo bar baz"),
+            "foo & bar & baz:*"
+        );
+    }
+
+    #[test]
+    fn build_prefix_tsquery_strips_tsquery_operators() {
+        // Punctuation / tsquery operators in raw input must not survive into the
+        // to_tsquery string, or they'd inject syntax.
+        assert_eq!(build_prefix_tsquery("foo:bar"), "foobar:*");
+        assert_eq!(build_prefix_tsquery("a&b | c!"), "ab & c:*");
+        assert_eq!(build_prefix_tsquery("(x)"), "x:*");
+    }
+
+    #[test]
+    fn build_prefix_tsquery_empty_when_no_tokens() {
+        // Only-operator input collapses to empty -> to_tsquery('') matches nothing.
+        assert_eq!(build_prefix_tsquery("&|!()"), "");
+        assert_eq!(build_prefix_tsquery("   "), "");
     }
 
     #[test]

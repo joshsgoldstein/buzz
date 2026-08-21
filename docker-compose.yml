@@ -169,6 +169,36 @@ services:
       com.buzz.env: "dev"
     restart: unless-stopped
 
+  cockroachdb:
+    image: cockroachdb/cockroach:latest-v25.4
+    container_name: buzz-cockroachdb
+    command: start-single-node --insecure
+    # SQL wire port 26257; DB Console on 8081 (container 8080) to avoid the
+    # keycloak (8180) / adminer (8082) / prometheus (9090) host ports.
+    # The buzz database is not created here — the dual-db test harness
+    # (scripts/dual-db-migrate-check.sh) creates its own scratch database.
+    ports:
+      - "127.0.0.1:26257:26257"
+      - "127.0.0.1:8081:8080"
+    volumes:
+      - cockroachdb-data:/cockroach/cockroach-data
+    networks:
+      - buzz-net
+    healthcheck:
+      test: ["CMD", "cockroach", "sql", "--insecure", "-e", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    labels:
+      com.buzz.service: "cockroachdb"
+      com.buzz.env: "dev"
+    restart: unless-stopped
+
 volumes:
   postgres-data:
     name: buzz-postgres-data
@@ -182,6 +212,10 @@ volumes:
     name: buzz-prometheus-data
     labels:
       com.buzz.volume: "prometheus"
+  cockroachdb-data:
+    name: buzz-cockroachdb-data
+    labels:
+      com.buzz.volume: "cockroachdb"
 
 networks:
   buzz-net:
