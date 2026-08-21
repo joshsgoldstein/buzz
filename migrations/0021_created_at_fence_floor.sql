@@ -46,29 +46,56 @@ LANGUAGE plpgsql AS $$
 DECLARE
     floor_secs numeric := nullif(current_setting('buzz.created_at_floor', true), '')::numeric;
 BEGIN
+    -- CockroachDB does not support column-list triggers (AFTER UPDATE OF col),
+    -- so the trigger below fires on every UPDATE and we scope to the created_at
+    -- / channel_id columns here in the body instead. This is equivalent to the
+    -- original "AFTER UPDATE OF created_at, channel_id" arm and is valid on
+    -- PostgreSQL too. INSERT always proceeds (OLD is NULL under TG_OP='INSERT').
+    -- Composite OLD/NEW field access is parenthesized so it parses on CRDB.
+    IF TG_OP = 'UPDATE'
+       AND (OLD).created_at IS NOT DISTINCT FROM (NEW).created_at
+       AND (OLD).channel_id IS NOT DISTINCT FROM (NEW).channel_id
+    THEN
+        RETURN NULL;
+    END IF;
+
     IF floor_secs IS NOT NULL
        AND floor_secs > 0
-       AND NEW.channel_id IS NOT NULL
-       AND NEW.created_at < clock_timestamp() - make_interval(secs => floor_secs)
+       AND (NEW).channel_id IS NOT NULL
+       -- Dual-compat: (n * interval '1 second') instead of make_interval(secs => n);
+       -- CockroachDB does not support the `=>` named-argument call syntax.
+       AND (NEW).created_at < clock_timestamp() - (floor_secs * interval '1 second')
     THEN
         RAISE EXCEPTION
             'events.created_at % is more than % s before commit time %; below the replica-fence floor',
-            NEW.created_at, floor_secs, clock_timestamp()
+            (NEW).created_at, floor_secs, clock_timestamp()
             USING ERRCODE = 'check_violation';
     END IF;
     RETURN NULL;
 END
 $$;
 
--- INSERT OR UPDATE OF: an UPDATE can move a previously exempt row into the
+-- INSERT OR UPDATE: an UPDATE can move a previously exempt row into the
 -- guarded set (channel_id NULL -> NOT NULL) or move a channel row's
 -- created_at below the fence, so both mutation paths re-run the guard on the
 -- NEW row. Partition-key note: a created_at rewrite that crosses partition
 -- bounds is executed as DELETE + INSERT, which fires the cloned AFTER INSERT
--- guard on the destination partition; an in-partition rewrite fires the
--- UPDATE OF arm. Either way the NEW row is checked.
-CREATE CONSTRAINT TRIGGER events_created_at_floor
-    AFTER INSERT OR UPDATE OF created_at, channel_id ON events
-    DEFERRABLE INITIALLY DEFERRED
+-- guard on the destination partition; an in-partition rewrite fires the UPDATE
+-- arm (scoped to created_at/channel_id in the function body). Either way the
+-- NEW row is checked.
+--
+-- CockroachDB compatibility: CockroachDB does not support CREATE CONSTRAINT
+-- TRIGGER or DEFERRABLE triggers, so this is a plain AFTER INSERT OR UPDATE
+-- row trigger. The practical effect is that the floor is measured at
+-- statement time rather than at COMMIT time (clock_timestamp() is evaluated
+-- when the trigger fires, not during commit processing). On PostgreSQL this
+-- narrows the enforcement window slightly — a transaction that holds an
+-- accepted insert open for longer than the floor budget after the statement
+-- ran is no longer caught at COMMIT — but the acceptance-time ingest check
+-- plus the closed replica breaker on backfills keep the fence intact. On
+-- CockroachDB the buzz.created_at_floor GUC is never set (the relay only sets
+-- it on its PostgreSQL writer pool), so the guard is inert there regardless.
+CREATE TRIGGER events_created_at_floor
+    AFTER INSERT OR UPDATE ON events
     FOR EACH ROW
     EXECUTE FUNCTION events_created_at_floor_guard();

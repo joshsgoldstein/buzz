@@ -37,8 +37,12 @@ ALTER TABLE product_feedback ADD CONSTRAINT product_feedback_community_id_fkey
 -- not ownership, so they are neither fenced nor purged with a tenant.
 DROP TRIGGER IF EXISTS community_write_fence_product_feedback ON product_feedback;
 DROP TRIGGER IF EXISTS community_write_fence_rate_limit_violations ON rate_limit_violations;
+-- PARALLEL clause omitted for CockroachDB compatibility (it does not implement
+-- PARALLEL SAFE/UNSAFE in CREATE FUNCTION); the redefinition must keep the same
+-- signature 0029 declared. IMMUTABLE STRICT is honored on both engines. Valid on
+-- PostgreSQL too.
 CREATE OR REPLACE FUNCTION community_write_fence_excluded_table(target NAME) RETURNS BOOLEAN
-LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE AS $$
+LANGUAGE SQL IMMUTABLE STRICT AS $$
     SELECT target::TEXT = ANY (ARRAY[
         'community_deletion_requests', 'community_deletion_approvals',
         'community_deletion_checkpoints', 'community_serving_write_leases',

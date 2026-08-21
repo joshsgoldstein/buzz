@@ -26,22 +26,33 @@ CREATE OR REPLACE FUNCTION refresh_channel_ttl_after_event_insert() RETURNS trig
 LANGUAGE plpgsql AS $$
 DECLARE
     channel_ttl INTEGER;
+    -- CockroachDB does not support PERFORM, so the advisory-lock call is written
+    -- as SELECT ... INTO a throwaway variable. Valid on PostgreSQL too.
+    -- Composite NEW field access is parenthesized so it parses on CockroachDB.
+    _dummy bigint;
 BEGIN
     -- Kind 9007 creates the channel and initializes its deadline itself.
-    IF NEW.channel_id IS NOT NULL AND NEW.kind <> 9007 THEN
+    IF (NEW).channel_id IS NOT NULL AND (NEW).kind <> 9007 THEN
         BEGIN
-            PERFORM pg_advisory_xact_lock_shared(hashtextextended(
-                'buzz_channel_ttl:' || NEW.community_id::text || ':' || NEW.channel_id::text, 0));
+            -- Dual-compat shared lock on the per-channel TTL key via the keyed
+            -- xact_advisory_locks table (CRDB has no advisory-lock builtins).
+            -- Preserves 0024's shared-on-the-hot-path design: event inserts hold
+            -- it FOR SHARE concurrently; the permanent->ephemeral / TTL-change
+            -- transition (channel update in the Rust layer) takes it exclusive.
+            SELECT xact_lock_shared(
+                ('x' || substr(md5('buzz_channel_ttl:' || (NEW).community_id::text || ':' || (NEW).channel_id::text), 1, 16))::bit(64)::bigint
+            ) INTO _dummy;
 
             SELECT ttl_seconds INTO channel_ttl
             FROM channels
-            WHERE community_id = NEW.community_id AND id = NEW.channel_id;
+            WHERE community_id = (NEW).community_id AND id = (NEW).channel_id;
 
             IF channel_ttl IS NOT NULL THEN
                 UPDATE channels
-                SET ttl_deadline = clock_timestamp() + make_interval(secs => ttl_seconds)
-                WHERE community_id = NEW.community_id
-                  AND id = NEW.channel_id
+                -- Dual-compat: (n * interval '1 second') not make_interval(secs => n).
+                SET ttl_deadline = clock_timestamp() + (ttl_seconds * interval '1 second')
+                WHERE community_id = (NEW).community_id
+                  AND id = (NEW).channel_id
                   AND ttl_seconds IS NOT NULL
                   AND archived_at IS NULL
                   AND deleted_at IS NULL;
@@ -49,8 +60,11 @@ BEGIN
         EXCEPTION WHEN OTHERS THEN
             -- Preserve the existing best-effort contract: a TTL refresh failure
             -- must not reject an otherwise valid durable event.
-            RAISE WARNING 'channel TTL refresh failed for community %, channel %: %',
-                NEW.community_id, NEW.channel_id, SQLERRM;
+            -- Dual-compat: SQLERRM is dropped from the message — CockroachDB
+            -- resolves bare SQLERRM as a column here ("column sqlerrm does not
+            -- exist"); the warning still fires with the community/channel ids.
+            RAISE WARNING 'channel TTL refresh failed for community %, channel %',
+                (NEW).community_id, (NEW).channel_id;
         END;
     END IF;
     RETURN NULL;
