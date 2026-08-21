@@ -100,6 +100,33 @@ async fn ensure_partition(
         )));
     }
 
+    // Dual-compat: no-op unless the parent is a declaratively-partitioned table
+    // (pg_class.relkind = 'p'). The dual-compatible schema (migration 0001) makes
+    // events/delivery_log plain tables: CockroachDB has no declarative
+    // partitioning and range-distributes automatically, and plain PostgreSQL no
+    // longer partitions them either. In both cases `CREATE TABLE ... PARTITION OF`
+    // is invalid, so partition management becomes a no-op and monthly retention
+    // shifts to a DELETE-by-time sweep. Cheap and correct on both engines (a
+    // plain PG table and every CRDB table are relkind 'r', not 'p').
+    let parent_is_partitioned: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_class c
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = current_schema()
+              AND c.relname = $1
+              AND c.relkind = 'p'
+        )
+        "#,
+    )
+    .bind(table_name)
+    .fetch_one(pool)
+    .await?;
+    if !parent_is_partitioned {
+        return Ok(());
+    }
+
     let partition_name = format!("{table_name}_p{suffix}");
 
     let row = sqlx::query(

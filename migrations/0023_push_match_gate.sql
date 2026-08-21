@@ -31,6 +31,11 @@
 -- must take xact_lock_exclusive() on the SAME table with the SAME key formula for
 -- the guard to be complete; see the buzz-db port notes.
 CREATE TABLE xact_advisory_locks (key INT8 PRIMARY KEY);
+-- Operator-global infrastructure table: lock-coordination keys (md5-derived
+-- bigints), never tenant data — so it is exempt from the community_id scoping
+-- invariant enforced on tenant tables.
+INSERT INTO _operator_global_tables (table_name, reason) VALUES
+    ('xact_advisory_locks', 'advisory-lock emulation key registry; lock coordination metadata, never tenant data');
 
 CREATE FUNCTION xact_lock_shared(k INT8) RETURNS INT8 LANGUAGE plpgsql AS $$
 DECLARE _d INT8;

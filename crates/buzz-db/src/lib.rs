@@ -19,6 +19,8 @@ pub mod archived_identities;
 pub mod channel;
 /// Durable whole-community deletion lifecycle and PostgreSQL adapter.
 pub mod deletion;
+/// Runtime SQL dialect detection (PostgreSQL vs CockroachDB).
+pub mod dialect;
 /// Direct message channel persistence.
 pub mod dm;
 /// Database error types.
@@ -234,6 +236,10 @@ pub struct Db {
     /// not yet probed (or the probe hit a transient error and will retry).
     /// Shared across `Db` clones.
     pub(crate) reader_aurora_identity: std::sync::Arc<std::sync::OnceLock<bool>>,
+    /// SQL engine behind `pool`, probed once at startup. Consulted only by the
+    /// genuinely engine-divergent subsystems (partition management, read
+    /// routing); everything else is written to the PG/CRDB intersection.
+    pub(crate) dialect: dialect::Dialect,
 }
 
 /// The session that served (or will serve) a routed read, so follow-up
@@ -676,6 +682,9 @@ impl Db {
     /// proof hold for every insert path that goes through this pool.
     pub async fn new(config: &DbConfig) -> Result<Self> {
         let pool = Self::connect_pool(config, &config.database_url).await?;
+        // Probe the engine once (fail closed on error) so the partition and
+        // read-routing subsystems can branch PostgreSQL vs CockroachDB.
+        let dialect = dialect::detect(&pool).await?;
         let read_max_connections = config
             .read_max_connections
             .unwrap_or(config.max_connections);
@@ -692,7 +701,13 @@ impl Db {
             fence: std::sync::Arc::new(replica_fence::ReplicaFence::new()),
             replica_read_max_age,
             reader_aurora_identity: std::sync::Arc::new(std::sync::OnceLock::new()),
+            dialect,
         })
+    }
+
+    /// The SQL engine behind this handle (PostgreSQL or CockroachDB).
+    pub fn dialect(&self) -> dialect::Dialect {
+        self.dialect
     }
 
     /// Connect the writer pool with all session-level safety premises.
@@ -816,6 +831,9 @@ impl Db {
             fence: std::sync::Arc::new(replica_fence::ReplicaFence::new()),
             replica_read_max_age: None,
             reader_aurora_identity: std::sync::Arc::new(std::sync::OnceLock::new()),
+            // Sync test constructor: default to Postgres (the test DB). Use
+            // `Db::new` for real startup dialect detection.
+            dialect: dialect::Dialect::Postgres,
         }
     }
 
@@ -835,6 +853,8 @@ impl Db {
             fence: std::sync::Arc::new(replica_fence::ReplicaFence::new()),
             replica_read_max_age: None,
             reader_aurora_identity: std::sync::Arc::new(std::sync::OnceLock::new()),
+            // Sync test constructor: default to Postgres (the test DB).
+            dialect: dialect::Dialect::Postgres,
         }
     }
 
