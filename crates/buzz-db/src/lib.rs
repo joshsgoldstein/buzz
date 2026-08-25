@@ -1517,7 +1517,9 @@ impl Db {
 
         // Serialize on the owner pubkey so concurrent creates to the same
         // owner cannot both pass the ownership count check.
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        // CRDB emulation (migration 0023): xact_lock_exclusive replaces
+        // pg_advisory_xact_lock; the Rust-computed i64 key is reused unchanged.
+        sqlx::query("SELECT xact_lock_exclusive($1)")
             .bind(relay_members::owner_count_advisory_lock_key(&owner_pubkey))
             .execute(&mut *tx)
             .await?;
@@ -4870,7 +4872,9 @@ impl Db {
 
         // Serialize all writers for the same (kind, pubkey, channel_id) tuple.
         // Advisory lock is transaction-scoped — released on commit/rollback.
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        // CRDB emulation (migration 0023): xact_lock_exclusive replaces
+        // pg_advisory_xact_lock; the Rust-computed i64 key is reused unchanged.
+        sqlx::query("SELECT xact_lock_exclusive($1)")
             .bind(lock_key)
             .execute(&mut *tx)
             .await?;
@@ -5051,7 +5055,9 @@ impl Db {
         // This serializes the entire read-build-write cycle: a concurrent
         // publication will block here until our transaction commits, then
         // read the updated membership state.
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        // CRDB emulation (migration 0023): xact_lock_exclusive replaces
+        // pg_advisory_xact_lock; the Rust-computed i64 key is reused unchanged.
+        sqlx::query("SELECT xact_lock_exclusive($1)")
             .bind(lock_key)
             .execute(&mut *tx)
             .await?;
@@ -5195,7 +5201,9 @@ impl Db {
 
         let mut tx = self.pool.begin().await?;
 
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        // CRDB emulation (migration 0023): xact_lock_exclusive replaces
+        // pg_advisory_xact_lock; the Rust-computed i64 key is reused unchanged.
+        sqlx::query("SELECT xact_lock_exclusive($1)")
             .bind(lock_key)
             .execute(&mut *tx)
             .await?;

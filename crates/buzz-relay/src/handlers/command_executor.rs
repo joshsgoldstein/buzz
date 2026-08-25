@@ -167,7 +167,9 @@ async fn persist_command_event(
             h as i64
         };
 
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        // CRDB emulation (migration 0023): xact_lock_exclusive replaces
+        // pg_advisory_xact_lock; the inline FNV i64 key is reused unchanged.
+        sqlx::query("SELECT xact_lock_exclusive($1)")
             .bind(lock_key)
             .execute(tx.as_mut())
             .await

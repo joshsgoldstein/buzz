@@ -25,7 +25,10 @@ async fn acquire_push_gate_lock(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     community: CommunityId,
 ) -> Result<()> {
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+    // CRDB has no advisory-lock builtins; xact_lock_exclusive (migration 0023)
+    // emulates a transaction-scoped exclusive lock via a keyed row. The md5 key
+    // form matches the SHARED side taken in the enqueue_push_match_job trigger.
+    sqlx::query("SELECT xact_lock_exclusive(('x' || substr(md5($1), 1, 16))::bit(64)::bigint)")
         .bind(format!("{PUSH_GATE_LOCK_NAMESPACE}{}", community.as_uuid()))
         .execute(&mut **tx)
         .await?;
@@ -230,11 +233,13 @@ pub async fn accept_lease_event(
     author_lock.extend_from_slice(community.as_uuid().as_bytes());
     author_lock.extend_from_slice(author);
     let author_lock = i64::from_le_bytes(Sha256::digest(&author_lock)[..8].try_into().unwrap());
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+    // CRDB emulation (migration 0023): xact_lock_exclusive replaces
+    // pg_advisory_xact_lock; the Rust-computed i64 key is reused unchanged.
+    sqlx::query("SELECT xact_lock_exclusive($1)")
         .bind(address_lock)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+    sqlx::query("SELECT xact_lock_exclusive($1)")
         .bind(author_lock)
         .execute(&mut *tx)
         .await?;

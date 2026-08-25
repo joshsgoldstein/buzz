@@ -1123,7 +1123,10 @@ impl DeletionStore {
     pub async fn begin_quiescing(&self, token: &LeaseToken) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         verify_lease(&mut tx, token, DeletionStage::Approved).await?;
-        sqlx::query("SELECT pg_advisory_xact_lock(community_deletion_lock_key($1))")
+        // CRDB emulation (migration 0023): xact_lock_exclusive replaces the
+        // pg_advisory_xact_lock builtin; community_deletion_lock_key still
+        // supplies the md5-derived bigint key.
+        sqlx::query("SELECT xact_lock_exclusive(community_deletion_lock_key($1))")
             .bind(token.community_id.as_uuid())
             .execute(&mut *tx)
             .await?;
@@ -1176,7 +1179,10 @@ impl DeletionStore {
     pub async fn fence(&self, token: &LeaseToken) -> Result<i64> {
         let mut tx = self.pool.begin().await?;
         verify_lease(&mut tx, token, DeletionStage::Approved).await?;
-        sqlx::query("SELECT pg_advisory_xact_lock(community_deletion_lock_key($1))")
+        // CRDB emulation (migration 0023): xact_lock_exclusive replaces the
+        // pg_advisory_xact_lock builtin; community_deletion_lock_key still
+        // supplies the md5-derived bigint key.
+        sqlx::query("SELECT xact_lock_exclusive(community_deletion_lock_key($1))")
             .bind(token.community_id.as_uuid())
             .execute(&mut *tx)
             .await?;
@@ -1878,7 +1884,10 @@ impl DeletionStore {
         .ok_or_else(|| DbError::NotFound(format!("community deletion {request_id}")))?;
         // Every lifecycle transition takes the community lock before any row lock.
         // Inverting this order lets abort and the executor deadlock each other.
-        sqlx::query("SELECT pg_advisory_xact_lock(community_deletion_lock_key($1))")
+        // CRDB emulation (migration 0023): xact_lock_exclusive replaces the
+        // pg_advisory_xact_lock builtin; community_deletion_lock_key still
+        // supplies the md5-derived bigint key.
+        sqlx::query("SELECT xact_lock_exclusive(community_deletion_lock_key($1))")
             .bind(community_id.as_uuid())
             .execute(&mut *tx)
             .await?;
@@ -2165,7 +2174,9 @@ impl DeletionStore {
         tx: &mut Transaction<'_, Postgres>,
         community: CommunityId,
     ) -> Result<()> {
-        sqlx::query("SELECT pg_advisory_xact_lock_shared(community_deletion_lock_key($1))")
+        // CRDB emulation (migration 0023): xact_lock_shared replaces the
+        // pg_advisory_xact_lock_shared builtin; key unchanged.
+        sqlx::query("SELECT xact_lock_shared(community_deletion_lock_key($1))")
             .bind(community.as_uuid())
             .execute(&mut **tx)
             .await?;
@@ -2197,7 +2208,9 @@ impl DeletionStore {
         tx: &mut Transaction<'_, Postgres>,
         lease: &ServingWriteLease,
     ) -> Result<()> {
-        sqlx::query("SELECT pg_advisory_xact_lock_shared(community_deletion_lock_key($1))")
+        // CRDB emulation (migration 0023): xact_lock_shared replaces the
+        // pg_advisory_xact_lock_shared builtin; key unchanged.
+        sqlx::query("SELECT xact_lock_shared(community_deletion_lock_key($1))")
             .bind(lease.community_id.as_uuid())
             .execute(&mut **tx)
             .await?;
@@ -2318,7 +2331,9 @@ impl DeletionStore {
     ) -> Result<()> {
         let lease_seconds = i64::try_from(lease_duration.as_secs()).unwrap_or(i64::MAX);
         let mut tx = self.pool.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock_shared(community_deletion_lock_key($1))")
+        // CRDB emulation (migration 0023): xact_lock_shared replaces the
+        // pg_advisory_xact_lock_shared builtin; key unchanged.
+        sqlx::query("SELECT xact_lock_shared(community_deletion_lock_key($1))")
             .bind(lease.community_id.as_uuid())
             .execute(&mut *tx)
             .await?;
@@ -2376,7 +2391,9 @@ impl DeletionStore {
     /// admitted remote effect.
     pub async fn verify_serving_write_lease(&self, lease: &ServingWriteLease) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock_shared(community_deletion_lock_key($1))")
+        // CRDB emulation (migration 0023): xact_lock_shared replaces the
+        // pg_advisory_xact_lock_shared builtin; key unchanged.
+        sqlx::query("SELECT xact_lock_shared(community_deletion_lock_key($1))")
             .bind(lease.community_id.as_uuid())
             .execute(&mut *tx)
             .await?;
@@ -2491,7 +2508,9 @@ impl DeletionStore {
 /// whole run (see [`crate::migration::run_migrations`]); shared holders do
 /// not block each other, so concurrent deletion executors are unaffected.
 async fn lock_schema_destruction_shared(conn: &mut PgConnection) -> Result<()> {
-    sqlx::query("SELECT pg_advisory_xact_lock_shared($1)")
+    // CRDB emulation (migration 0023): xact_lock_shared replaces the
+    // pg_advisory_xact_lock_shared builtin; the i64 key is reused unchanged.
+    sqlx::query("SELECT xact_lock_shared($1)")
         .bind(SCHEMA_DESTRUCTION_LOCK_KEY)
         .execute(conn)
         .await?;

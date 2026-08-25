@@ -473,7 +473,9 @@ pub async fn transfer_ownership(
 
     // 1. Serialize on the transferee so concurrent transfers to the same
     //    recipient cannot both pass the ownership count check.
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+    // CRDB emulation (migration 0023): xact_lock_exclusive replaces
+    // pg_advisory_xact_lock; the Rust-computed i64 key is reused unchanged.
+    sqlx::query("SELECT xact_lock_exclusive($1)")
         .bind(owner_count_advisory_lock_key(&pubkey))
         .execute(&mut *tx)
         .await?;

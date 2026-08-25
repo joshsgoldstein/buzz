@@ -355,7 +355,9 @@ async fn acquire_channel_membership_lock(
     community_id: CommunityId,
     channel_id: Uuid,
 ) -> Result<()> {
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+    // CRDB emulation (migration 0023): xact_lock_exclusive with the md5-derived
+    // bigint key. Same key form the paired shared-side triggers use.
+    sqlx::query("SELECT xact_lock_exclusive(('x' || substr(md5($1), 1, 16))::bit(64)::bigint)")
         .bind(format!(
             "{CHANNEL_MEMBERSHIP_LOCK_NAMESPACE}{}:{}",
             community_id.as_uuid(),
@@ -1244,7 +1246,9 @@ pub async fn update_channel(
     // Non-TTL updates don't touch the fast path and skip the lock.
     if updates.ttl_seconds.is_some() {
         let mut tx = pool.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        // CRDB emulation (migration 0023): xact_lock_exclusive with the
+        // md5-derived bigint key, matching the shared side in migration 0024.
+        sqlx::query("SELECT xact_lock_exclusive(('x' || substr(md5($1), 1, 16))::bit(64)::bigint)")
             .bind(format!(
                 "buzz_channel_ttl:{}:{}",
                 community_id.as_uuid(),
