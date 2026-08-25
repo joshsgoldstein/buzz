@@ -1026,7 +1026,19 @@ mod tests {
         assert!(deletion.contains("current_setting('transaction_isolation') <> 'read committed'"));
         assert!(deletion.contains("ERRCODE = 'invalid_transaction_state'"));
         assert!(deletion.contains("CREATE FUNCTION enforce_community_write_fence"));
-        assert!(deletion.contains("CREATE FUNCTION attach_community_write_fence"));
+        // The universal write fence is installed via explicit, static CREATE
+        // TRIGGER statements (one per community-scoped table, each running
+        // enforce_community_write_fence()), because CockroachDB rejects the old
+        // dynamic attach_community_write_fence(REGCLASS) generator + DO loop.
+        // These assertions still fail if the fence is removed.
+        assert!(!deletion.contains("CREATE FUNCTION attach_community_write_fence"));
+        assert!(deletion.contains(
+            "CREATE TRIGGER community_write_fence_events BEFORE INSERT OR UPDATE OR DELETE ON events"
+        ));
+        assert!(deletion.contains(
+            "CREATE TRIGGER community_write_fence_users BEFORE INSERT OR UPDATE OR DELETE ON users"
+        ));
+        assert!(deletion.contains("EXECUTE FUNCTION enforce_community_write_fence()"));
         assert!(deletion.contains("community_write_fence_excluded_table"));
         assert!(deletion.contains("CREATE FUNCTION enforce_community_tombstone"));
         assert!(deletion.contains("community tombstones are permanent"));
@@ -1382,9 +1394,22 @@ mod tests {
                         .expect("function identifier");
                     surface.functions.insert(function, normalized.clone());
                 } else if normalized.starts_with("create trigger") {
-                    let trigger = identifier_after_keyword(&statement, "create trigger")
-                        .expect("trigger identifier");
-                    surface.triggers.insert(trigger, normalized.clone());
+                    // The universal write fence is now installed as one static
+                    // CREATE TRIGGER per community-scoped table, each running
+                    // enforce_community_write_fence() — the CockroachDB-compatible
+                    // replacement for the old dynamic attach_community_write_fence()
+                    // generator + DO loop. Collect those per-table trigger targets
+                    // as fence attachments; every other trigger (the deletion-request
+                    // guards, the tombstone guard) is compared structurally.
+                    if normalized.contains("enforce_community_write_fence()") {
+                        let target = identifier_after_keyword(&statement, " on ")
+                            .expect("write-fence trigger target table");
+                        surface.fence_attachments.insert(target);
+                    } else {
+                        let trigger = identifier_after_keyword(&statement, "create trigger")
+                            .expect("trigger identifier");
+                        surface.triggers.insert(trigger, normalized.clone());
+                    }
                 } else if normalized.starts_with("create index")
                     || normalized.starts_with("create unique index")
                 {
@@ -1409,14 +1434,6 @@ mod tests {
                             .to_owned();
                         surface.communities_added_columns.insert(column);
                     }
-                }
-                if let Some(position) = normalized.find("attach_community_write_fence('") {
-                    let target = normalized[position + "attach_community_write_fence('".len()..]
-                        .split('\'')
-                        .next()
-                        .expect("fence attachment target")
-                        .to_owned();
-                    surface.fence_attachments.insert(target);
                 }
             }
             surface
